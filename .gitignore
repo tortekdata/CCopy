@@ -1,0 +1,15 @@
+# Python midlertidige filer
+__pycache__/
+*.pyc
+
+# PyInstaller bygg-mapper (Dette er rotet vi ikke vil ha)
+build/
+dist/
+*.spec
+
+# VS Code innstillinger (Dine personlige valg)
+.vscode/
+
+# Virtuelt miljø (hvis du bruker det)
+.venv/
+env/
