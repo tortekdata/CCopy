@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import logging
 from pathlib import Path
+from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
@@ -20,7 +21,7 @@ from threading import Lock
 # VERSION / LICENSE
 # ============================================================
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 __license__ = "Freeware"
 
 # ============================================================
@@ -61,6 +62,9 @@ except ImportError:
         def update(self, n=1):
             pass
         
+        def set_postfix(self, **kwargs):
+            pass
+        
         @staticmethod
         def format_bytes(size):
             for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -73,7 +77,8 @@ except ImportError:
 # GLOBALS
 # ============================================================
 
-lock = Lock()
+console_lock = Lock()
+stats_lock = Lock()
 logger = logging.getLogger("ccopy")
 
 # ============================================================
@@ -98,8 +103,13 @@ def check_python():
 
 
 def validate_args(args, parser):
+    # Manual version check to ensure output in frozen exe
+    if args.version:
+        print(f"CCopy {__version__} ({__license__})")
+        sys.exit(0)
+
     if not args.source or not args.dest:
-        parser.error("Both source and destination are required")
+        parser.error("Both source and destination are required (unless using --version)")
 
     if args.verify and args.verify_after:
         parser.error("--verify and --verify-after cannot be used together")
@@ -140,15 +150,27 @@ def setup_logging(logfile=None, level="info"):
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
     if logfile:
-        fh = logging.FileHandler(logfile, encoding="utf-8")
-        fh.setFormatter(fmt)
-        fh.setLevel(logging.DEBUG if level == "debug" else logging.INFO)
-        logger.addHandler(fh)
+        try:
+            if logfile.parent and not logfile.parent.exists():
+                try:
+                    logfile.parent.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass 
+
+            fh = logging.FileHandler(logfile, encoding="utf-8")
+            fh.setFormatter(fmt)
+            fh.setLevel(logging.DEBUG if level == "debug" else logging.INFO)
+            logger.addHandler(fh)
+            return True
+        except OSError as e:
+            print(f"WARNING: Could not create log file: {e}")
+            return False
 
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     ch.setLevel(logging.WARNING)
     logger.addHandler(ch)
+    return False
 
 # ============================================================
 # FILE COLLECTION
@@ -210,26 +232,19 @@ def sha256_stream(path, buf):
 # ============================================================
 
 def copy_file(src, dst, size, buf, total_bar, do_verify, update_mode):
-    """
-    Returns: 0=Failed, 1=Copied, 2=Skipped
-    """
     dst.parent.mkdir(parents=True, exist_ok=True)
-    
     src_stat = src.stat()
 
-    # --update check --
     if update_mode and dst.exists():
         try:
             dst_stat = dst.stat()
-            # Check size and time (allow 2 seconds diff)
             if dst_stat.st_size == size and abs(src_stat.st_mtime - dst_stat.st_mtime) < 2.0:
-                with lock:
+                with console_lock:
                     total_bar.update(size)
                 return 2 # Skipped
         except OSError:
             pass 
 
-    # Normal Copy
     tmp = dst.with_suffix(dst.suffix + ".ccopy_tmp")
     h = hashlib.sha256() if do_verify else None
 
@@ -239,12 +254,10 @@ def copy_file(src, dst, size, buf, total_bar, do_verify, update_mode):
                 fd.write(chunk)
                 if h:
                     h.update(chunk)
-                with lock:
+                with console_lock:
                     total_bar.update(len(chunk))
 
         tmp.replace(dst)
-        
-        # KEY FIX: Copy timestamp from source to dest
         os.utime(dst, (src_stat.st_atime, src_stat.st_mtime))
 
         if do_verify:
@@ -277,24 +290,19 @@ def benchmark(sample, buf, verify):
     return (total / 1024**2) / elapsed if elapsed > 0 else 0
 
 # ============================================================
-# INTERACTIVE PROMPT
-# ============================================================
-
-def ask(prompt):
-    try:
-        ans = input(prompt).strip().lower()
-        return ans in ("", "y", "yes")
-    except KeyboardInterrupt:
-        return False
-
-# ============================================================
 # MAIN
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(prog="ccopy")
-    parser.add_argument("source", type=Path)
-    parser.add_argument("dest", type=Path)
+    parser = argparse.ArgumentParser(prog="ccopy", add_help=False)
+    # Define arguments manually to control version output
+    parser.add_argument("source", type=Path, nargs="?")
+    parser.add_argument("dest", type=Path, nargs="?")
+    parser.add_argument("--help", "-h", action="help", default=argparse.SUPPRESS, help="Show this help message and exit")
+    
+    # Changed to store_true so we can handle printing manually
+    parser.add_argument("--version", action="store_true", help="Show version number and exit")
+    
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--ask", action="store_true")
@@ -303,21 +311,37 @@ def main():
     parser.add_argument("--verify-after", action="store_true")
     parser.add_argument("--move", action="store_true")
     parser.add_argument("--update", action="store_true", help="Skip files that exist with same size/time")
+    parser.add_argument("--log", nargs='?', const="AUTO", help="Log file path or directory.")
+    parser.add_argument("--log-level", choices=["info", "debug"], default="info")
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS)
     parser.add_argument("--buffer", type=int, default=DEFAULT_BUFFER_MB)
-    parser.add_argument("--log", type=Path)
-    parser.add_argument("--log-level", choices=["info", "debug"], default="info")
-    parser.add_argument("--version", action="version", version=f"CCopy {__version__} ({__license__})")
 
     args = parser.parse_args()
     check_python()
-    validate_args(args, parser)
+    validate_args(args, parser) # Version check happens inside here now
     check_paths(args.source, args.dest)
-    setup_logging(args.log, args.log_level)
+
+    final_log_path = None
+    if args.log:
+        auto_name = f"ccopy_log_{date.today()}.txt"
+        if args.log == "AUTO":
+            final_log_path = Path.cwd() / auto_name
+        else:
+            user_path = Path(args.log)
+            if user_path.is_dir() or (not user_path.exists() and not user_path.suffix):
+                try:
+                    user_path.mkdir(parents=True, exist_ok=True)
+                    final_log_path = user_path / auto_name
+                except OSError as e:
+                    print(f"Warning: Could not create log dir {user_path}: {e}")
+                    final_log_path = user_path 
+            else:
+                final_log_path = user_path
+    
+    log_enabled = setup_logging(final_log_path, args.log_level)
 
     logger.info(f"CCopy {__version__} started")
 
-    # ---- SCAN ----
     files = collect_files(args.source)
     total_bytes = sum(size for _, size in files)
     if not files:
@@ -326,13 +350,10 @@ def main():
 
     sample, sample_bytes = sample_files(files)
 
-    # ---- DRY RUN ----
     if args.dry_run:
-        print(f"\nDry-run summary")
-        print(f"Files: {len(files)} / {total_bytes / 1024**3:.2f} GB")
+        print(f"\nDry-run summary: {len(files)} files / {total_bytes / 1024**3:.2f} GB")
         sys.exit(0)
 
-    # ---- BENCHMARK / AUTO ----
     if args.benchmark or args.auto:
         print("\nBenchmarking...")
         results = []
@@ -352,11 +373,10 @@ def main():
             args.threads, args.buffer = safe[0], safe[1]
             args.verify_after = True
 
-    # ---- COPY ----
     buf = args.buffer * 1024 * 1024
-    copied = [] # List of (src, dst) that were ACTUALLY copied
+    copied = []
     
-    print("\nRunning CCopy")
+    print(f"\nRunning CCopy {__version__}")
     print(f"Threads: {args.threads}, Update: {args.update}, Verify: {args.verify_after or args.verify}")
     print(f"Mode: {'MOVE' if args.move else 'COPY'}\n")
 
@@ -364,50 +384,79 @@ def main():
     fail_count = 0
     skipped_count = 0
 
-    with tqdm(total=total_bytes, unit="B", unit_scale=True, desc="COPY") as total:
-        def worker(item):
-            nonlocal success_count, fail_count, skipped_count
-            src, size = item
-            dst = args.dest / src.relative_to(args.source)
-            
-            res = copy_file(src, dst, size, buf, total, args.verify, args.update)
-            
-            if res == 1: # Copied
-                copied.append((src, dst))
-                return 1
-            elif res == 2: # Skipped
-                skipped_count += 1
-                return 2
-            else: # Failed
-                return 0
+    try:
+        with tqdm(total=total_bytes, unit="B", unit_scale=True, desc="COPY") as total:
+            def worker(item):
+                nonlocal success_count, fail_count, skipped_count
+                src, size = item
+                dst = args.dest / src.relative_to(args.source)
+                
+                res = copy_file(src, dst, size, buf, total, args.verify, args.update)
+                
+                with stats_lock:
+                    if res == 1: pass 
+                    elif res == 2: skipped_count += 1
+                    else: fail_count += 1
+                    total.set_postfix(Skip=skipped_count, Fail=fail_count)
+                return (res, src, dst)
 
-        with ThreadPoolExecutor(max_workers=args.threads) as ex:
-            results = list(ex.map(worker, files))
-            success_count = sum(1 for r in results if r == 1)
-            fail_count = sum(1 for r in results if r == 0)
+            with ThreadPoolExecutor(max_workers=args.threads) as ex:
+                for res_code, s, d in ex.map(worker, files):
+                    if res_code == 1:
+                        copied.append((s, d))
+                        success_count += 1
+        
+        # VERIFICATION
+        if args.verify_after and copied:
+            print(f"\nPost-copy verification ({len(copied)} files)...")
+            verify_ok = 0
+            verify_fail = 0
+            with tqdm(total=len(copied), unit="file", desc="VERIFY") as pbar:
+                for src, dst in copied:
+                    is_ok = False
+                    try:
+                        if sha256_stream(src, buf) == sha256_stream(dst, buf):
+                            is_ok = True
+                        else:
+                            logger.error(f"Verification failed: {src}")
+                    except OSError as e:
+                        logger.error(f"Error verification: {src} ({e})")
+                    
+                    if is_ok:
+                        verify_ok += 1
+                    else:
+                        verify_fail += 1
+                        fail_count += 1
+                        success_count -= 1
 
-    # ---- VERIFY AFTER ----
-    if args.verify_after and copied:
-        print(f"\nPost-copy verification ({len(copied)} files)...")
-        # Added Progress Bar for Verification
-        with tqdm(total=len(copied), unit="file", desc="VERIFY") as pbar:
+                    pbar.set_postfix(OK=verify_ok, Skip=skipped_count, Fail=fail_count)
+                    pbar.update(1)
+
+        # MOVE DELETE
+        if args.move:
             for src, dst in copied:
                 try:
-                    if sha256_stream(src, buf) != sha256_stream(dst, buf):
-                        logger.error(f"Verification failed: {src}")
+                    src.unlink()
                 except OSError as e:
-                    logger.error(f"Error verification: {src} ({e})")
-                pbar.update(1)
+                    logger.error(f"Delete failed: {src} ({e})")
 
-    # ---- MOVE ----
-    if args.move:
-        for src, dst in copied:
-            try:
-                src.unlink()
-            except OSError as e:
-                logger.error(f"Delete failed: {src} ({e})")
+        print(f"\n[OK] Done. Copied: {success_count}, Skipped: {skipped_count}, Failed: {fail_count}")
+        if log_enabled and final_log_path:
+            print(f"[INFO] Log file saved to: {final_log_path.absolute()}")
 
-    print(f"\n✅ Done. Copied: {success_count}, Skipped: {skipped_count}, Failed: {fail_count}")
+    except KeyboardInterrupt:
+        print("\n\n[STOP] Avbrutt av bruker.")
+        try:
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n[STOP] Avbrutt av bruker.")
+        try:
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)
