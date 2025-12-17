@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CCopy – smart copy tool with progress, benchmark, auto mode and verification
+CCopy – smart copy/move tool with progress, benchmark, auto mode and verification
 
 License: Freeware
 AS IS – No warranty. Use at your own risk.
@@ -20,7 +20,7 @@ from threading import Lock
 # VERSION / LICENSE
 # ============================================================
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 __license__ = "Freeware"
 
 AS_IS_NOTICE = (
@@ -35,7 +35,7 @@ AS_IS_NOTICE = (
 # CONFIG
 # ============================================================
 
-MAX_SAMPLE_BYTES = 1 * 1024**3     # 1 GB
+MAX_SAMPLE_BYTES = 1 * 1024**3   # 1 GB
 MAX_SAMPLE_FILES = 100
 DEFAULT_BUFFER_MB = 1
 DEFAULT_THREADS = 1
@@ -99,7 +99,8 @@ def validate_args(args, parser):
         parser.error("--auto cannot be combined with --ask")
 
     if args.move and not (args.verify or args.verify_after):
-        parser.error("--move requires --verify or --verify-after for safety")
+        logger.warning("--move without verification is unsafe. Forcing --verify-after.")
+        args.verify_after = True
 
 
 def check_paths(src: Path, dst: Path):
@@ -121,47 +122,54 @@ def check_paths(src: Path, dst: Path):
 def setup_logging(logfile=None, level="info"):
     logger.setLevel(logging.DEBUG)
 
-    fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s"
-    )
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    # File log
     if logfile:
         fh = logging.FileHandler(logfile, encoding="utf-8")
         fh.setFormatter(fmt)
         fh.setLevel(logging.DEBUG if level == "debug" else logging.INFO)
         logger.addHandler(fh)
 
-    # Console log (important messages only)
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     ch.setLevel(logging.WARNING)
     logger.addHandler(ch)
 
 # ============================================================
-# FILE SCANNING / SAMPLING
+# FILE COLLECTION
 # ============================================================
 
 def collect_files(base: Path):
+    """
+    Returns list of (Path, size) tuples
+    """
+    result = []
     for root, _, names in os.walk(base):
         for n in names:
-            yield Path(root) / n
+            p = Path(root) / n
+            try:
+                size = p.stat().st_size
+                result.append((p, size))
+            except OSError:
+                logger.warning(f"Skipping unreadable file: {p}")
+    return result
 
+# ============================================================
+# SAMPLING (FIXED)
+# ============================================================
 
-def sample_files(files):
+def sample_files(file_entries):
+    """
+    file_entries: list of (Path, size)
+    """
     sample = []
     total = 0
 
-    for f in files:
-        try:
-            size = f.stat().st_size
-        except OSError:
-            continue
-
+    for path, size in file_entries:
         if total + size > MAX_SAMPLE_BYTES:
             break
 
-        sample.append((f, size))
+        sample.append((path, size))
         total += size
 
         if len(sample) >= MAX_SAMPLE_FILES:
@@ -181,7 +189,7 @@ def sha256_stream(path, buf):
     return h.hexdigest()
 
 # ============================================================
-# COPY WORKER (SAFE COPY + STREAMING HASH)
+# COPY WORKER (SAFE)
 # ============================================================
 
 def copy_file(src, dst, buf, total_bar, do_verify):
@@ -207,7 +215,8 @@ def copy_file(src, dst, buf, total_bar, do_verify):
 
         return True
 
-    except Exception:
+    except Exception as e:
+        logger.error(f"Copy failed: {src} -> {dst} ({e})")
         if tmp.exists():
             tmp.unlink(missing_ok=True)
         raise
@@ -249,15 +258,11 @@ def ask(prompt):
 def main():
     parser = argparse.ArgumentParser(
         prog="ccopy",
-        description=(
-            "CCopy – smart copy tool with progress, benchmark and verification\n\n"
-            "License: Freeware\n"
-            "This software is provided \"AS IS\". Use at your own risk."
-        )
+        description="CCopy – safe copy/move tool with progress, auto mode and verification"
     )
 
-    parser.add_argument("source", nargs="?", type=Path)
-    parser.add_argument("dest", nargs="?", type=Path)
+    parser.add_argument("source", type=Path)
+    parser.add_argument("dest", type=Path)
 
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
@@ -274,19 +279,11 @@ def main():
     parser.add_argument("--log", type=Path)
     parser.add_argument("--log-level", choices=["info", "debug"], default="info")
 
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"CCopy {__version__} ({__license__})"
-    )
-
-    if len(sys.argv) == 1:
-        parser.print_help()
-        sys.exit(0)
+    parser.add_argument("--version", action="version",
+                        version=f"CCopy {__version__} ({__license__})")
 
     args = parser.parse_args()
 
-    # ---- PREFLIGHT ----
     check_python()
     check_dependencies()
     validate_args(args, parser)
@@ -298,24 +295,15 @@ def main():
     logger.info(f"CCopy version {__version__} started")
 
     # ---- SCAN ----
-    files = list(collect_files(args.source))
-    sizes = []
-    total_bytes = 0
+    files = collect_files(args.source)
+    total_bytes = sum(size for _, size in files)
 
-    for f in files:
-        try:
-            s = f.stat().st_size
-            sizes.append((f, s))
-            total_bytes += s
-        except OSError:
-            pass
-
-    sample, sample_bytes = sample_files(iter(sizes))
+    sample, sample_bytes = sample_files(files)
 
     # ---- DRY RUN ----
     if args.dry_run:
         print("\nDry-run summary")
-        print(f"Files      : {len(sizes)}")
+        print(f"Files      : {len(files)}")
         print(f"Total size : {total_bytes / 1024**3:.2f} GB")
         print(f"Sample     : {len(sample)} files / {sample_bytes / 1024**2:.1f} MB")
         print(f"Intent     : {'SAFE' if args.verify or args.verify_after else 'FAST'}")
@@ -338,10 +326,7 @@ def main():
         for t, b, s in results:
             print(f"  threads={t} buffer={b}MB -> {s:.1f}")
 
-        print("\nRecommended FAST:")
-        print(f"  --threads {best[0]} --buffer {best[1]}")
-
-        print("Recommended SAFE:")
+        print("\nRecommended SAFE:")
         print(f"  --threads {safe[0]} --buffer {safe[1]} --verify-after")
 
         if args.auto:
@@ -356,7 +341,7 @@ def main():
         else:
             sys.exit(0)
 
-    # ---- COPY PHASE ----
+    # ---- COPY ----
     buf = args.buffer * 1024 * 1024
     copied = []
 
@@ -370,12 +355,11 @@ def main():
         def worker(item):
             src, _ = item
             dst = args.dest / src.relative_to(args.source)
-
             copy_file(src, dst, buf, total, args.verify)
             copied.append((src, dst))
 
         with ThreadPoolExecutor(max_workers=args.threads) as ex:
-            list(ex.map(worker, sizes))
+            list(ex.map(worker, files))
 
     # ---- VERIFY AFTER ----
     if args.verify_after:
@@ -384,7 +368,7 @@ def main():
             if sha256_stream(src, buf) != sha256_stream(dst, buf):
                 fatal(f"Verification failed: {src}")
 
-    # ---- MOVE CLEANUP ----
+    # ---- MOVE ----
     if args.move:
         for src, _ in copied:
             src.unlink()
