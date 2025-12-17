@@ -20,7 +20,7 @@ from threading import Lock
 # VERSION / LICENSE
 # ============================================================
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 __license__ = "Freeware"
 
 # ============================================================
@@ -41,10 +41,16 @@ try:
     from tqdm import tqdm
 except ImportError:
     class tqdm:
-        def __init__(self, total=0, **kwargs):
-            self.total = total
+        def __init__(self, iterable=None, total=0, **kwargs):
+            self.iterable = iterable
+            self.total = total or (len(iterable) if iterable else 0)
             self.n = 0
-            print(f"Processing {self.format_bytes(total)}... (Install 'tqdm' for progress bar)")
+            print(f"Processing... (Install 'tqdm' for progress bar)")
+
+        def __iter__(self):
+            for item in self.iterable:
+                yield item
+                self.update()
 
         def __enter__(self):
             return self
@@ -149,10 +155,6 @@ def setup_logging(logfile=None, level="info"):
 # ============================================================
 
 def collect_files(base: Path):
-    """
-    Returns list of (Path, size) tuples
-    Skips system folders to prevent PermissionError.
-    """
     result = []
     SKIP_DIRS = {
         "System Volume Information",
@@ -209,24 +211,23 @@ def sha256_stream(path, buf):
 
 def copy_file(src, dst, size, buf, total_bar, do_verify, update_mode):
     """
-    Returns:
-      0 = Failed
-      1 = Copied
-      2 = Skipped (Update mode)
+    Returns: 0=Failed, 1=Copied, 2=Skipped
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
+    
+    src_stat = src.stat()
 
     # --update check --
     if update_mode and dst.exists():
         try:
             dst_stat = dst.stat()
-            # Check size and time (allow 2 seconds diff for FAT/NTFS variances)
-            if dst_stat.st_size == size and abs(src.stat().st_mtime - dst_stat.st_mtime) < 2.0:
+            # Check size and time (allow 2 seconds diff)
+            if dst_stat.st_size == size and abs(src_stat.st_mtime - dst_stat.st_mtime) < 2.0:
                 with lock:
                     total_bar.update(size)
                 return 2 # Skipped
         except OSError:
-            pass # If cannot read stat, just copy to be safe
+            pass 
 
     # Normal Copy
     tmp = dst.with_suffix(dst.suffix + ".ccopy_tmp")
@@ -242,6 +243,9 @@ def copy_file(src, dst, size, buf, total_bar, do_verify, update_mode):
                     total_bar.update(len(chunk))
 
         tmp.replace(dst)
+        
+        # KEY FIX: Copy timestamp from source to dest
+        os.utime(dst, (src_stat.st_atime, src_stat.st_mtime))
 
         if do_verify:
             if h.hexdigest() != sha256_stream(dst, buf):
@@ -360,7 +364,7 @@ def main():
     fail_count = 0
     skipped_count = 0
 
-    with tqdm(total=total_bytes, unit="B", unit_scale=True, desc="TOTAL") as total:
+    with tqdm(total=total_bytes, unit="B", unit_scale=True, desc="COPY") as total:
         def worker(item):
             nonlocal success_count, fail_count, skipped_count
             src, size = item
@@ -385,17 +389,18 @@ def main():
     # ---- VERIFY AFTER ----
     if args.verify_after and copied:
         print(f"\nPost-copy verification ({len(copied)} files)...")
-        for src, dst in copied:
-            try:
-                if sha256_stream(src, buf) != sha256_stream(dst, buf):
-                    logger.error(f"Verification failed: {src}")
-            except OSError as e:
-                logger.error(f"Error verification: {src} ({e})")
+        # Added Progress Bar for Verification
+        with tqdm(total=len(copied), unit="file", desc="VERIFY") as pbar:
+            for src, dst in copied:
+                try:
+                    if sha256_stream(src, buf) != sha256_stream(dst, buf):
+                        logger.error(f"Verification failed: {src}")
+                except OSError as e:
+                    logger.error(f"Error verification: {src} ({e})")
+                pbar.update(1)
 
     # ---- MOVE ----
     if args.move:
-        # Note: In update mode, we only delete files we actually copied/verified.
-        # Files that were skipped remain on source (safer behavior).
         for src, dst in copied:
             try:
                 src.unlink()
